@@ -56,7 +56,7 @@ const char* WIFI_SSID     = "TP-LINK_2899";
 const char* WIFI_PASSWORD = "tepelink";
 
 // Dapatkan API key gratis di https://aistudio.google.com/apikey
-const char* GEMINI_API_KEY = "AQ.Ab8RN6LDMnL3MkHF-8GD5P2pSCOBqzpaHDtGiPriL2S8ivi1dQ";
+const char* GEMINI_API_KEY = "GANTI API KEY";
 const char* GEMINI_MODEL   = "gemini-3.6-flash";
 
 // Prompt yang dikirim bersama gambar ke AI. Silakan ubah sesuai kebutuhan
