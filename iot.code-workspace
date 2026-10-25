@@ -1,0 +1,64 @@
+{
+	"folders": [
+		{
+			"path": "../wokwi"
+		},
+		{
+			"name": "Internet Of Things 1",
+			"path": "Internet Of Things 1"
+		},
+		{
+			"name": "Praktik Basic Input Output",
+			"path": "Praktik Basic Input Output"
+		},
+		{
+			"name": "Praktik PWM LED",
+			"path": "Praktik PWM LED"
+		},
+		{
+			"name": "Praktik Pembacaan Sensor Sederhana",
+			"path": "Praktik Pembacaan Sensor Sederhana"
+		},
+		{
+			"name": "Praktik UART",
+			"path": "Praktik UART"
+		},
+		{
+			"name": "Praktik UART 2",
+			"path": "Praktik UART 2"
+		},
+		{
+			"name": "Praktik I2C 1",
+			"path": "Praktik I2C 1"
+		},
+		{
+			"name": "Praktik I2C 2",
+			"path": "Praktik I2C 2"
+		},
+		{
+			"name": "Tugas I2C Individu",
+			"path": "Tugas I2C Individu"
+		},
+		{
+			"name": "Tugas I2C Individu 2",
+			"path": "Tugas I2C Individu 2"
+		},
+		{
+			"name": "Project SPI RFID",
+			"path": "Project SPI RFID"
+		},
+		{
+			"name": "Line Follower",
+			"path": "Line Follower"
+		},
+		{
+			"name": "DHT11 OLED Rumah",
+			"path": "DHT11 OLED Rumah"
+		},
+		{
+			"name": "Rumah - Lirik Lagu",
+			"path": "Rumah - Lirik Lagu"
+		}
+	],
+	"settings": {}
+}

@@ -1,0 +1,789 @@
+/*
+  ESP32 LINE FOLLOWER - PID + OLED SSD1306
+  Gabungan main2.cpp (PID) dan main3.cpp (OLED robust).
+  Target: Arduino-ESP32 core 2.0.17 (API ledcSetup / ledcAttachPin / ledcWrite(channel)).
+*/
+#include <Arduino.h>
+#include <Wire.h>
+#include <string.h>
+#include <stdarg.h>
+
+// ===== MOTOR DRIVER L298N =====
+#define ENA 25
+#define IN1 26
+#define IN2 27
+#define IN3 18
+#define IN4 19
+#define ENB 23
+
+// Core 2.x memakai nomor channel LEDC (0-15), bukan nomor pin.
+#define PWM_LEFT_CHANNEL  0
+#define PWM_RIGHT_CHANNEL 1
+#define PWM_FREQ 1000
+#define PWM_RESOLUTION 8
+
+// ===== OLED I2C 128x64 =====
+#define OLED_SDA 21
+#define OLED_SCL 22
+#define OLED_WIDTH 128
+#define OLED_HEIGHT 64
+
+#define OLED_ADDRESS_1 0x3C
+#define OLED_ADDRESS_2 0x3D
+
+// Ubah ke 1 jika OLED 1.3" (chip SH1106).
+#define OLED_IS_SH1106 0
+
+// 100 kHz adalah kecepatan yang sudah terbukti hidup di modul OLED ini.
+// Boleh dicoba 400000UL kalau ingin refresh lebih cepat.
+#define OLED_I2C_CLOCK 100000UL
+
+#if OLED_IS_SH1106
+#define OLED_COLUMN_OFFSET 2
+#else
+#define OLED_COLUMN_OFFSET 0
+#endif
+
+uint8_t oledBuffer[OLED_WIDTH * OLED_HEIGHT / 8];
+uint8_t oledAddress = OLED_ADDRESS_1;
+bool oledReady = false;
+bool oledDirty = true;
+bool wireStarted = false;
+int8_t oledFlushPage = -1; // -1 = idle, 0..7 = halaman berikutnya yang dikirim
+unsigned long lastOledRetry = 0;
+unsigned long lastOledRefresh = 0;
+uint16_t oledBeginAttempts = 0;
+
+const unsigned long OLED_RETRY_MS = 2000UL;
+const unsigned long OLED_REFRESH_MS = 1000UL;
+
+// ===== SENSOR BFD-1000 =====
+// Urutan fisik kiri ke kanan: S5, S4, S3, S2, S1
+const int sensorPins[5] = {34, 35, 36, 33, 32};
+const int weights[5] = {-2, -1, 0, 1, 2};
+
+#define CLP_PIN  4
+#define NEAR_PIN 5
+
+// Asumsi garis hitam menghasilkan LOW. Ubah ke HIGH jika terbalik.
+#define LINE_ACTIVE_LEVEL LOW
+
+// ===== PUSH BUTTON =====
+#define BTN_START      13
+#define BTN_SPEED_UP   14
+#define BTN_SPEED_DOWN 16
+#define BTN_STOP       17
+
+// ===== PENGATURAN ROBOT DAN PID =====
+int baseSpeed = 100;
+const int minSpeed = 70;
+const int maxSpeed = 200;
+
+float Kp = 35.0f;
+float Ki = 2.0f;
+float Kd = 0.25f;
+
+const unsigned long PID_SAMPLE_US = 10000UL; // 10 ms
+const float INTEGRAL_LIMIT = 1.5f;
+const int MAX_CORRECTION = 90;
+
+// Halaman OLED hanya dikirim dalam jendela ini setelah tick PID terakhir,
+// supaya transfer I2C selesai sebelum tick berikutnya jatuh tempo.
+const unsigned long PID_SAFE_WINDOW_US = 3000UL;
+
+bool robotRunning = false;
+bool tuningMode = false;
+uint8_t selectedPID = 0; // 0=Kp, 1=Ki, 2=Kd
+
+float lastError = 0.0f;
+float integral = 0.0f;
+float filteredDerivative = 0.0f;
+unsigned long lastPIDTime = 0;
+
+int rawSensors[5];
+unsigned long lastPrint = 0;
+
+const unsigned long debounceMs = 35UL;
+const unsigned long longPressMs = 800UL;
+
+// #region agent log
+#define DBG_SESSION "3fa29d"
+#define DBG_RUN "run1"
+
+static void dbgLog(const char *hyp, const char *loc, const char *msg,
+                   const char *dataFmt, ...) {
+  char data[224];
+  va_list args;
+  va_start(args, dataFmt);
+  vsnprintf(data, sizeof(data), dataFmt, args);
+  va_end(args);
+  Serial.printf("{\"sessionId\":\"" DBG_SESSION "\",\"runId\":\"" DBG_RUN
+                "\",\"hypothesisId\":\"%s\",\"location\":\"%s\",\"message\":\"%s\""
+                ",\"data\":{%s},\"timestamp\":%lu}\n",
+                hyp, loc, msg, data, (unsigned long)millis());
+}
+// #endregion
+
+// ===== STATE TOMBOL =====
+enum ButtonEvent : uint8_t {
+  BUTTON_NONE,
+  BUTTON_SHORT,
+  BUTTON_LONG
+};
+
+struct ButtonState {
+  bool lastReading = HIGH;
+  bool stableState = HIGH;
+  bool longPressSent = false;
+  unsigned long lastChange = 0;
+  unsigned long pressedAt = 0;
+};
+
+ButtonState startButton;
+ButtonState upButton;
+ButtonState downButton;
+ButtonState stopButton;
+
+ButtonEvent readButtonEvent(int pin, ButtonState &button) {
+  const unsigned long now = millis();
+  const bool reading = digitalRead(pin);
+
+  if (reading != button.lastReading) {
+    button.lastReading = reading;
+    button.lastChange = now;
+  }
+
+  if (now - button.lastChange >= debounceMs &&
+      reading != button.stableState) {
+    button.stableState = reading;
+
+    if (reading == LOW) {
+      button.pressedAt = now;
+      button.longPressSent = false;
+    } else {
+      button.pressedAt = 0;
+      if (!button.longPressSent) {
+        return BUTTON_SHORT;
+      }
+      button.longPressSent = false;
+    }
+  }
+
+  if (button.stableState == LOW && !button.longPressSent &&
+      now - button.pressedAt >= longPressMs) {
+    button.longPressSent = true;
+    return BUTTON_LONG;
+  }
+
+  return BUTTON_NONE;
+}
+
+// ===== PWM MOTOR: API CORE 2.x =====
+void setupPWM() {
+  uint32_t leftFreq = ledcSetup(PWM_LEFT_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
+  uint32_t rightFreq = ledcSetup(PWM_RIGHT_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
+
+  ledcAttachPin(ENA, PWM_LEFT_CHANNEL);
+  ledcAttachPin(ENB, PWM_RIGHT_CHANNEL);
+
+  ledcWrite(PWM_LEFT_CHANNEL, 0);
+  ledcWrite(PWM_RIGHT_CHANNEL, 0);
+
+  // #region agent log
+  // Uji tulis duty dengan IN1..IN4 masih LOW: driver mati, motor tidak bergerak,
+  // tapi readback channel membuktikan jalur PWM hidup atau tidak.
+  ledcWrite(PWM_LEFT_CHANNEL, 128);
+  ledcWrite(PWM_RIGHT_CHANNEL, 128);
+  uint32_t probeLeft = ledcRead(PWM_LEFT_CHANNEL);
+  uint32_t probeRight = ledcRead(PWM_RIGHT_CHANNEL);
+  uint32_t probeLegacyLeft = ledcRead(ENA);
+  dbgLog("A", "main.cpp:setupPWM", "ledc setup dan readback",
+         "\"setupFreqL\":%u,\"setupFreqR\":%u,\"wrote\":128,"
+         "\"readCh%d\":%u,\"readCh%d\":%u,\"readAsPin%d\":%u",
+         leftFreq, rightFreq,
+         PWM_LEFT_CHANNEL, probeLeft, PWM_RIGHT_CHANNEL, probeRight,
+         ENA, probeLegacyLeft);
+  ledcWrite(PWM_LEFT_CHANNEL, 0);
+  ledcWrite(PWM_RIGHT_CHANNEL, 0);
+  // #endregion
+}
+
+// ===== KONTROL MOTOR =====
+// Kecepatan positif = maju, negatif = mundur.
+void setMotor(int leftSpeed, int rightSpeed) {
+  leftSpeed = constrain(leftSpeed, -255, 255);
+  rightSpeed = constrain(rightSpeed, -255, 255);
+
+  // Motor kiri
+  if (leftSpeed > 0) {
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+  } else if (leftSpeed < 0) {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+  } else {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, LOW);
+  }
+
+  // Motor kanan
+  if (rightSpeed > 0) {
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+  } else if (rightSpeed < 0) {
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, HIGH);
+  } else {
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, LOW);
+  }
+
+  ledcWrite(PWM_LEFT_CHANNEL, abs(leftSpeed));
+  ledcWrite(PWM_RIGHT_CHANNEL, abs(rightSpeed));
+
+  // #region agent log
+  static int lastLoggedLeft = 32767;
+  static int lastLoggedRight = 32767;
+  static unsigned long lastMotorLog = 0;
+  if ((abs(leftSpeed - lastLoggedLeft) >= 5 ||
+       abs(rightSpeed - lastLoggedRight) >= 5) &&
+      millis() - lastMotorLog >= 50UL) {
+    lastMotorLog = millis();
+    lastLoggedLeft = leftSpeed;
+    lastLoggedRight = rightSpeed;
+    dbgLog("A", "main.cpp:setMotor", "duty diminta vs terbaca",
+           "\"reqL\":%d,\"reqR\":%d,\"dutyL\":%u,\"dutyR\":%u,"
+           "\"in1\":%d,\"in2\":%d,\"in3\":%d,\"in4\":%d",
+           leftSpeed, rightSpeed,
+           ledcRead(PWM_LEFT_CHANNEL), ledcRead(PWM_RIGHT_CHANNEL),
+           digitalRead(IN1), digitalRead(IN2),
+           digitalRead(IN3), digitalRead(IN4));
+  }
+  // #endregion
+}
+
+void stopMotor() {
+  setMotor(0, 0);
+}
+
+// ===== BACA SENSOR =====
+void readSensors() {
+  for (int i = 0; i < 5; i++) {
+    rawSensors[i] = digitalRead(sensorPins[i]);
+  }
+}
+
+// ===== PID TUNING DENGAN TOMBOL =====
+void adjustSelectedPID(int direction) {
+  if (selectedPID == 0) {
+    Kp = constrain(Kp + direction * 0.5f, 0.0f, 100.0f);
+  } else if (selectedPID == 1) {
+    Ki = constrain(Ki + direction * 0.05f, 0.0f, 10.0f);
+  } else {
+    Kd = constrain(Kd + direction * 0.05f, 0.0f, 10.0f);
+  }
+}
+
+void resetPIDState() {
+  integral = 0.0f;
+  filteredDerivative = 0.0f;
+  lastError = 0.0f;
+  lastPIDTime = micros();
+}
+
+void handleButtons() {
+  const int oldBaseSpeed = baseSpeed;
+  const float oldKp = Kp;
+  const float oldKi = Ki;
+  const float oldKd = Kd;
+  const bool oldRobotRunning = robotRunning;
+  const bool oldTuningMode = tuningMode;
+  const uint8_t oldSelectedPID = selectedPID;
+
+  ButtonEvent startEvent = readButtonEvent(BTN_START, startButton);
+  ButtonEvent upEvent = readButtonEvent(BTN_SPEED_UP, upButton);
+  ButtonEvent downEvent = readButtonEvent(BTN_SPEED_DOWN, downButton);
+  ButtonEvent stopEvent = readButtonEvent(BTN_STOP, stopButton);
+
+  if (startEvent == BUTTON_LONG) {
+    tuningMode = !tuningMode;
+    robotRunning = false;
+    stopMotor();
+    if (tuningMode) {
+      resetPIDState();
+    }
+  } else if (startEvent == BUTTON_SHORT) {
+    if (tuningMode) {
+      selectedPID = (selectedPID + 1) % 3;
+    } else {
+      robotRunning = true;
+      resetPIDState();
+    }
+  }
+
+  if (stopEvent != BUTTON_NONE) {
+    robotRunning = false;
+    stopMotor();
+  }
+
+  if (upEvent != BUTTON_NONE) {
+    if (tuningMode) {
+      adjustSelectedPID(1);
+    } else {
+      baseSpeed = min(baseSpeed + 10, maxSpeed);
+    }
+  }
+
+  if (downEvent != BUTTON_NONE) {
+    if (tuningMode) {
+      adjustSelectedPID(-1);
+    } else {
+      baseSpeed = max(baseSpeed - 10, minSpeed);
+    }
+  }
+
+  // #region agent log
+  if (startEvent != BUTTON_NONE || stopEvent != BUTTON_NONE ||
+      upEvent != BUTTON_NONE || downEvent != BUTTON_NONE) {
+    dbgLog("E", "main.cpp:handleButtons", "event tombol",
+           "\"start\":%d,\"stop\":%d,\"up\":%d,\"down\":%d,"
+           "\"running\":%d,\"tuning\":%d,\"sel\":%u,\"speed\":%d",
+           (int)startEvent, (int)stopEvent, (int)upEvent, (int)downEvent,
+           robotRunning ? 1 : 0, tuningMode ? 1 : 0,
+           selectedPID, baseSpeed);
+  }
+  // #endregion
+
+  if (baseSpeed != oldBaseSpeed || Kp != oldKp || Ki != oldKi || Kd != oldKd ||
+      robotRunning != oldRobotRunning || tuningMode != oldTuningMode ||
+      selectedPID != oldSelectedPID) {
+    oledDirty = true;
+  }
+}
+
+// ===== OLED I2C TANPA LIBRARY TAMBAHAN =====
+bool oledCommand(uint8_t command) {
+  Wire.beginTransmission(oledAddress);
+  Wire.write(0x00); // control byte: command
+  Wire.write(command);
+  return Wire.endTransmission() == 0;
+}
+
+uint8_t oledProbe(uint8_t address) {
+  Wire.beginTransmission(address);
+  return Wire.endTransmission();
+}
+
+bool oledBegin() {
+  if (!wireStarted) {
+    Wire.begin(OLED_SDA, OLED_SCL);
+    Wire.setClock(OLED_I2C_CLOCK);
+    wireStarted = true;
+  }
+
+  oledBeginAttempts++;
+
+  uint8_t err1 = oledProbe(OLED_ADDRESS_1);
+  uint8_t err2 = (err1 == 0) ? 0xFF : oledProbe(OLED_ADDRESS_2);
+
+  bool found = true;
+  if (err1 == 0) {
+    oledAddress = OLED_ADDRESS_1;
+  } else if (err2 == 0) {
+    oledAddress = OLED_ADDRESS_2;
+  } else {
+    found = false;
+  }
+
+  uint8_t initErr = 0xFF;
+  if (found) {
+    const uint8_t initCommands[] = {
+      0xAE,       // display off
+      0xD5, 0x80, // clock divide
+      0xA8, 0x3F, // multiplex 1/64
+      0xD3, 0x00, // display offset
+      0x40,       // start line
+      0x8D, 0x14, // charge pump
+      0x20, 0x02, // page addressing mode
+      0xA1,       // segment remap
+      0xC8,       // COM scan direction
+      0xDA, 0x12, // COM pins
+      0x81, 0xCF, // contrast
+      0xD9, 0xF1, // precharge
+      0xDB, 0x40, // VCOM detect
+      0xA4,       // display follows RAM
+      0xA6,       // normal display
+      0xAF        // display on
+    };
+
+    Wire.beginTransmission(oledAddress);
+    Wire.write(0x00);
+    Wire.write(initCommands, sizeof(initCommands));
+    initErr = Wire.endTransmission();
+  }
+
+  // #region agent log
+  dbgLog("B", "main.cpp:oledBegin", "hasil probe dan init OLED",
+         "\"attempt\":%u,\"probe0x3C\":%u,\"probe0x3D\":%u,\"found\":%d,"
+         "\"addr\":%u,\"initErr\":%u,\"clock\":%lu",
+         oledBeginAttempts, err1, err2, found ? 1 : 0,
+         found ? oledAddress : 0, initErr, (unsigned long)OLED_I2C_CLOCK);
+  // #endregion
+
+  return found && initErr == 0;
+}
+
+const uint8_t *oledGlyph(char character) {
+  static const uint8_t letters[26][5] = {
+    {0x7E,0x11,0x11,0x11,0x7E}, {0x7F,0x49,0x49,0x49,0x36},
+    {0x3E,0x41,0x41,0x41,0x22}, {0x7F,0x41,0x41,0x22,0x1C},
+    {0x7F,0x49,0x49,0x49,0x41}, {0x7F,0x09,0x09,0x09,0x01},
+    {0x3E,0x41,0x49,0x49,0x7A}, {0x7F,0x08,0x08,0x08,0x7F},
+    {0x00,0x41,0x7F,0x41,0x00}, {0x20,0x40,0x41,0x3F,0x01},
+    {0x7F,0x08,0x14,0x22,0x41}, {0x7F,0x40,0x40,0x40,0x40},
+    {0x7F,0x02,0x0C,0x02,0x7F}, {0x7F,0x04,0x08,0x10,0x7F},
+    {0x3E,0x41,0x41,0x41,0x3E}, {0x7F,0x09,0x09,0x09,0x06},
+    {0x3E,0x41,0x51,0x21,0x5E}, {0x7F,0x09,0x19,0x29,0x46},
+    {0x46,0x49,0x49,0x49,0x31}, {0x01,0x01,0x7F,0x01,0x01},
+    {0x3F,0x40,0x40,0x40,0x3F}, {0x1F,0x20,0x40,0x20,0x1F},
+    {0x3F,0x40,0x38,0x40,0x3F}, {0x63,0x14,0x08,0x14,0x63},
+    {0x07,0x08,0x70,0x08,0x07}, {0x61,0x51,0x49,0x45,0x43}
+  };
+
+  static const uint8_t digits[10][5] = {
+    {0x3E,0x51,0x49,0x45,0x3E}, {0x00,0x42,0x7F,0x40,0x00},
+    {0x42,0x61,0x51,0x49,0x46}, {0x21,0x41,0x45,0x4B,0x31},
+    {0x18,0x14,0x12,0x7F,0x10}, {0x27,0x45,0x45,0x45,0x39},
+    {0x3C,0x4A,0x49,0x49,0x30}, {0x01,0x71,0x09,0x05,0x03},
+    {0x36,0x49,0x49,0x49,0x36}, {0x06,0x49,0x49,0x29,0x1E}
+  };
+
+  static const uint8_t blank[5] = {0,0,0,0,0};
+  static const uint8_t colon[5] = {0,0x36,0x36,0,0};
+  static const uint8_t period[5] = {0,0x60,0x60,0,0};
+  static const uint8_t greater[5] = {0x00,0x41,0x22,0x14,0x08};
+  static const uint8_t minus[5] = {0x08,0x08,0x08,0x08,0x08};
+  static const uint8_t slash[5] = {0x20,0x10,0x08,0x04,0x02};
+
+  if (character >= 'A' && character <= 'Z') {
+    return letters[character - 'A'];
+  }
+  if (character >= 'a' && character <= 'z') {
+    return letters[character - 'a'];
+  }
+  if (character >= '0' && character <= '9') {
+    return digits[character - '0'];
+  }
+
+  switch (character) {
+    case ':': return colon;
+    case '.': return period;
+    case '>': return greater;
+    case '-': return minus;
+    case '/': return slash;
+    default: return blank;
+  }
+}
+
+void oledDrawPixel(int x, int y) {
+  if (x < 0 || x >= OLED_WIDTH || y < 0 || y >= OLED_HEIGHT) {
+    return;
+  }
+  oledBuffer[x + (y / 8) * OLED_WIDTH] |= (uint8_t)(1U << (y & 7));
+}
+
+void oledDrawChar(int x, int y, char character) {
+  const uint8_t *glyph = oledGlyph(character);
+  for (int column = 0; column < 5; column++) {
+    for (int row = 0; row < 7; row++) {
+      if (glyph[column] & (1U << row)) {
+        oledDrawPixel(x + column, y + row);
+      }
+    }
+  }
+}
+
+void oledDrawText(int x, int y, const char *text) {
+  while (*text && x < OLED_WIDTH) {
+    oledDrawChar(x, y, *text++);
+    x += 6;
+  }
+}
+
+// Mengirim satu halaman (128 byte) ke layar.
+bool oledSendPage(uint8_t page) {
+  if (!oledCommand(0xB0 + page)) return false;
+  if (!oledCommand(0x00 | (OLED_COLUMN_OFFSET & 0x0F))) return false;
+  if (!oledCommand(0x10 | (OLED_COLUMN_OFFSET >> 4))) return false;
+
+  for (uint8_t column = 0; column < OLED_WIDTH; column += 32) {
+    uint8_t count = min((int)32, OLED_WIDTH - column);
+    Wire.beginTransmission(oledAddress);
+    Wire.write(0x40); // control byte: display data
+    Wire.write(&oledBuffer[page * OLED_WIDTH + column], count);
+    if (Wire.endTransmission() != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Menggambar ke buffer saja (tanpa I2C), jadi murah untuk dipanggil kapan pun.
+void oledRender() {
+  memset(oledBuffer, 0, sizeof(oledBuffer));
+
+  oledDrawText(0, 0, tuningMode ? "PID TUNING" : "PID CONTROL");
+
+  char line[20];
+  snprintf(line, sizeof(line), "%cKP:%.2f", selectedPID == 0 ? '>' : ' ', Kp);
+  oledDrawText(0, 12, line);
+  snprintf(line, sizeof(line), "%cKI:%.2f", selectedPID == 1 ? '>' : ' ', Ki);
+  oledDrawText(0, 22, line);
+  snprintf(line, sizeof(line), "%cKD:%.2f", selectedPID == 2 ? '>' : ' ', Kd);
+  oledDrawText(0, 32, line);
+
+  snprintf(line, sizeof(line), "SPD:%d", baseSpeed);
+  oledDrawText(0, 44, line);
+  oledDrawText(78, 44, robotRunning ? "RUN" : "STOP");
+
+  oledDrawText(0, 56, tuningMode ? "START SEL UP/DN" : "HOLD START TUNE");
+}
+
+// Mengirim buffer satu halaman per pemanggilan, supaya loop PID tidak
+// tertahan selama seluruh transfer 1 KB.
+void oledService() {
+  const unsigned long now = millis();
+
+  if (!oledReady) {
+    if (now - lastOledRetry >= OLED_RETRY_MS) {
+      lastOledRetry = now;
+      oledReady = oledBegin();
+      if (oledReady) {
+        oledDirty = true;
+        oledFlushPage = -1;
+        lastOledRefresh = now;
+      }
+    }
+    return;
+  }
+
+  if (!robotRunning && now - lastOledRefresh >= OLED_REFRESH_MS) {
+    lastOledRefresh = now;
+    oledDirty = true;
+  }
+
+  // #region agent log
+  static unsigned long flushStartUs = 0;
+  static unsigned long flushMaxPageUs = 0;
+  // #endregion
+
+  if (oledDirty && oledFlushPage < 0) {
+    oledRender();
+    oledDirty = false;
+    oledFlushPage = 0;
+    // #region agent log
+    flushStartUs = micros();
+    flushMaxPageUs = 0;
+    // #endregion
+  }
+
+  if (oledFlushPage < 0) {
+    return;
+  }
+
+  // Saat robot berjalan, kirim hanya di awal jendela PID.
+  if (robotRunning && micros() - lastPIDTime > PID_SAFE_WINDOW_US) {
+    return;
+  }
+
+  const unsigned long pageStartUs = micros();
+  const bool ok = oledSendPage((uint8_t)oledFlushPage);
+  const unsigned long pageUs = micros() - pageStartUs;
+
+  // #region agent log
+  if (pageUs > flushMaxPageUs) {
+    flushMaxPageUs = pageUs;
+  }
+  // #endregion
+
+  if (!ok) {
+    // #region agent log
+    dbgLog("B", "main.cpp:oledService", "gagal kirim halaman OLED",
+           "\"page\":%d,\"pageUs\":%lu,\"running\":%d",
+           (int)oledFlushPage, pageUs, robotRunning ? 1 : 0);
+    // #endregion
+    // Error I2C (misalnya noise motor). Tandai mati agar dicoba init ulang.
+    oledReady = false;
+    oledFlushPage = -1;
+    return;
+  }
+
+  oledFlushPage++;
+  if (oledFlushPage > 7) {
+    oledFlushPage = -1;
+    // #region agent log
+    dbgLog("D", "main.cpp:oledService", "selesai kirim 1 frame OLED",
+           "\"totalUs\":%lu,\"maxPageUs\":%lu,\"running\":%d,\"clock\":%lu",
+           micros() - flushStartUs, flushMaxPageUs,
+           robotRunning ? 1 : 0, (unsigned long)OLED_I2C_CLOCK);
+    // #endregion
+  }
+}
+
+// ===== LOGIKA LINE FOLLOWER PID =====
+void followLine() {
+  unsigned long now = micros();
+
+  if (now - lastPIDTime < PID_SAMPLE_US) {
+    return;
+  }
+
+  const unsigned long elapsedUs = now - lastPIDTime;
+  float dt = elapsedUs / 1000000.0f;
+  lastPIDTime = now;
+
+  int weightedSum = 0;
+  int detectedCount = 0;
+
+  for (int i = 0; i < 5; i++) {
+    if (rawSensors[i] == LINE_ACTIVE_LEVEL) {
+      weightedSum += weights[i];
+      detectedCount++;
+    }
+  }
+
+  // Semua sensor di luar garis: berhenti dan reset komponen PID.
+  if (detectedCount == 0) {
+    stopMotor();
+    integral = 0.0f;
+    filteredDerivative = 0.0f;
+    lastError = 0.0f;
+
+    // #region agent log
+    static unsigned long lastLostLog = 0;
+    if (millis() - lastLostLog >= 500UL) {
+      lastLostLog = millis();
+      dbgLog("C", "main.cpp:followLine", "cabang garis hilang, motor distop",
+             "\"s\":[%d,%d,%d,%d,%d],\"activeLevel\":%d,\"dtUs\":%lu",
+             rawSensors[0], rawSensors[1], rawSensors[2],
+             rawSensors[3], rawSensors[4],
+             (int)LINE_ACTIVE_LEVEL, elapsedUs);
+    }
+    // #endregion
+    return;
+  }
+
+  float error = (float)weightedSum / detectedCount;
+
+  integral += error * dt;
+  integral = constrain(integral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
+
+  float derivative = (error - lastError) / dt;
+  const float alpha = 0.7f;
+  filteredDerivative = alpha * filteredDerivative
+                     + (1.0f - alpha) * derivative;
+
+  float output = Kp * error + Ki * integral + Kd * filteredDerivative;
+  lastError = error;
+
+  int correction = constrain((int)output, -MAX_CORRECTION, MAX_CORRECTION);
+  int leftSpeed = constrain(baseSpeed + correction, 0, 255);
+  int rightSpeed = constrain(baseSpeed - correction, 0, 255);
+
+  setMotor(leftSpeed, rightSpeed);
+
+  // #region agent log
+  static uint16_t tick = 0;
+  if ((tick++ % 25) == 0) {
+    dbgLog("CD", "main.cpp:followLine", "satu siklus PID",
+           "\"s\":[%d,%d,%d,%d,%d],\"count\":%d,\"err\":%.3f,"
+           "\"integral\":%.3f,\"deriv\":%.2f,\"out\":%.2f,\"corr\":%d,"
+           "\"L\":%d,\"R\":%d,\"dtUs\":%lu",
+           rawSensors[0], rawSensors[1], rawSensors[2],
+           rawSensors[3], rawSensors[4], detectedCount, error,
+           integral, filteredDerivative, output, correction,
+           leftSpeed, rightSpeed, elapsedUs);
+  }
+  // #endregion
+}
+
+// ===== SETUP =====
+void setup() {
+  Serial.begin(115200);
+  delay(300); // beri waktu daya stabil dan Serial Monitor siap
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  // Pastikan driver mati sebelum PWM diuji.
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+
+  setupPWM();
+
+  for (int i = 0; i < 5; i++) {
+    pinMode(sensorPins[i], INPUT);
+  }
+
+  pinMode(CLP_PIN, INPUT);
+  pinMode(NEAR_PIN, INPUT);
+  pinMode(BTN_START, INPUT_PULLUP);
+  pinMode(BTN_SPEED_UP, INPUT_PULLUP);
+  pinMode(BTN_SPEED_DOWN, INPUT_PULLUP);
+  pinMode(BTN_STOP, INPUT_PULLUP);
+
+  resetPIDState();
+  readSensors();
+
+  // #region agent log
+  dbgLog("CE", "main.cpp:setup", "kondisi awal sensor dan tombol",
+         "\"s\":[%d,%d,%d,%d,%d],\"activeLevel\":%d,"
+         "\"btnStart\":%d,\"btnUp\":%d,\"btnDown\":%d,\"btnStop\":%d,"
+         "\"clp\":%d,\"near\":%d",
+         rawSensors[0], rawSensors[1], rawSensors[2],
+         rawSensors[3], rawSensors[4], (int)LINE_ACTIVE_LEVEL,
+         digitalRead(BTN_START), digitalRead(BTN_SPEED_UP),
+         digitalRead(BTN_SPEED_DOWN), digitalRead(BTN_STOP),
+         digitalRead(CLP_PIN), digitalRead(NEAR_PIN));
+  // #endregion
+
+  delay(100); // beri waktu OLED menyala sebelum diinisialisasi
+  oledReady = oledBegin();
+  lastOledRetry = millis();
+  lastOledRefresh = millis();
+  oledDirty = true;
+
+  Serial.println();
+  Serial.println("=== ESP32 LINE FOLLOWER PID + OLED ===");
+  Serial.println("START: jalan | STOP: berhenti");
+  Serial.println("Tahan START 0.8s: masuk/keluar menu tuning PID");
+}
+
+// ===== LOOP =====
+void loop() {
+  handleButtons();
+  readSensors();
+
+  if (robotRunning && !tuningMode) {
+    followLine();
+  } else {
+    stopMotor();
+  }
+
+  oledService();
+
+  if (millis() - lastPrint >= 1000UL) {
+    lastPrint = millis();
+    Serial.printf("S:%d%d%d%d%d SPD:%d PID:%.2f/%.2f/%.2f OLED:%s %s\n",
+                  rawSensors[0], rawSensors[1], rawSensors[2],
+                  rawSensors[3], rawSensors[4], baseSpeed, Kp, Ki, Kd,
+                  oledReady ? "OK" : "OFF",
+                  tuningMode ? "TUNING" : robotRunning ? "RUNNING" : "STOPPED");
+  }
+
+  delay(1);
+}

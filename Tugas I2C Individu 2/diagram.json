@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "author": "Faris Daffa",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 0, "left": 0, "attrs": {} },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn1",
+      "top": 265.4,
+      "left": 28.8,
+      "attrs": { "color": "green", "xray": "1" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn2",
+      "top": 265.4,
+      "left": 153.6,
+      "attrs": { "color": "blue", "xray": "1" }
+    },
+    {
+      "type": "wokwi-lcd1602",
+      "id": "lcd1",
+      "top": -89.6,
+      "left": 255.2,
+      "attrs": { "pins": "i2c" }
+    },
+    { "type": "wokwi-ds1307", "id": "rtc1", "top": 119.4, "left": 297.7, "attrs": {} }
+  ],
+  "connections": [
+    [ "esp:TX", "$serialMonitor:RX", "", [] ],
+    [ "esp:RX", "$serialMonitor:TX", "", [] ],
+    [ "esp:GND.2", "lcd1:GND", "black", [ "v0" ] ],
+    [ "esp:5V", "lcd1:VCC", "red", [ "h148.99", "v-249.7" ] ],
+    [ "esp:21", "lcd1:SDA", "green", [ "h91.24", "v-115.4" ] ],
+    [ "esp:22", "lcd1:SCL", "green", [ "h129.64", "v-77.1" ] ],
+    [ "esp:GND.2", "rtc1:GND", "black", [ "h110.44", "v153.6" ] ],
+    [ "esp:5V", "rtc1:5V", "red", [ "v-57.6", "h187.39", "h115.2" ] ],
+    [ "esp:21", "rtc1:SDA", "green", [ "h91.24", "v76.8", "h115.2" ] ],
+    [ "esp:22", "rtc1:SCL", "green", [ "h129.64", "v115.4" ] ],
+    [ "esp:18", "btn1:2.r", "green", [ "h24.04", "v191.8" ] ],
+    [ "esp:19", "btn2:2.r", "green", [ "h0" ] ],
+    [ "btn1:1.l", "esp:GND.2", "green", [ "h-67.2", "v-249.6" ] ],
+    [ "btn2:1.l", "esp:GND.2", "green", [ "h0" ] ]
+  ],
+  "dependencies": {}
+}
