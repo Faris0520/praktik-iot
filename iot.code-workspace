@@ -58,6 +58,14 @@
 		{
 			"name": "Rumah - Lirik Lagu",
 			"path": "Rumah - Lirik Lagu"
+		},
+		{
+			"name": "UTS IOT",
+			"path": "UTS IOT"
+		},
+		{
+			"name": "praktik_uts",
+			"path": "praktik_uts"
 		}
 	],
 	"settings": {}
